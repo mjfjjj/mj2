@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import os
+import random  # 👈 新增，用于随机休眠防封禁
 
 warnings.filterwarnings('ignore')
 
@@ -76,7 +77,9 @@ def get_lianban_stocks_main(date_str, lianban_num):
     stocks = stocks[stocks['ts_code'].apply(is_main_board)]
     return stocks
 
+# ================= 🛠️ 核心优化：全新防403/防封禁版 =================
 def get_next_day_pct(codes, base_date, skip_days=1, retry=3):
+    # 计算目标日期
     try:
         cal_df = pro.trade_cal(exchange='SSE', start_date=base_date,
                                end_date=(datetime.strptime(base_date,'%Y%m%d')+timedelta(days=15)).strftime('%Y%m%d'),
@@ -91,18 +94,9 @@ def get_next_day_pct(codes, base_date, skip_days=1, retry=3):
         if target_date >= datetime.now().strftime('%Y%m%d'):
             return None
     except:
-        try:
-            cal_df = ak.tool_trade_date_hist_sina()
-            cal_df['trade_date'] = pd.to_datetime(cal_df['trade_date'])
-            cal_dates = sorted(cal_df['trade_date'].dt.strftime('%Y%m%d').unique())
-            idx = cal_dates.index(base_date) if base_date in cal_dates else -1
-            if idx == -1 or idx + skip_days >= len(cal_dates):
-                return None
-            target_date = cal_dates[idx + skip_days]
-            if target_date >= datetime.now().strftime('%Y%m%d'):
-                return None
-        except:
-            return None
+        return None
+
+    # --- 方案A：优先使用Tushare批量获取（高效，且不容易被封） ---
     try:
         ts_codes_str = ','.join(codes)
         daily = pro.daily(ts_code=ts_codes_str, trade_date=target_date, fields='ts_code,pct_chg')
@@ -111,32 +105,42 @@ def get_next_day_pct(codes, base_date, skip_days=1, retry=3):
             return daily
     except:
         pass
-    try:
-        all_pct = []
-        for code in codes:
-            pure_code = code.replace('.SZ','').replace('.SH','').replace('.BJ','')
-            for attempt in range(retry):
-                try:
-                    hist = ak.stock_zh_a_hist(symbol=pure_code, period="daily",
-                                              start_date=target_date, end_date=target_date,
-                                              adjust="qfq")
-                    if hist is not None and not hist.empty:
-                        pct = hist.iloc[0]['涨跌幅']
-                        all_pct.append({'ts_code': code, 'pct_chg': pct})
-                        break
-                    time.sleep(0.1)
-                except:
-                    if attempt < retry - 1:
-                        time.sleep(0.5)
-                    else:
-                        print(f"   ⚠️ {code} 获取失败")
-        if all_pct:
-            res = pd.DataFrame(all_pct)
-            res['target_date'] = target_date
-            return res
-    except:
-        pass
+
+    # --- 方案B：回退到AkShare（单只单只获取，加随机休眠防封禁） ---
+    print(f"   ⏳ 降级到AkShare：{base_date} T+{skip_days} ({target_date})")
+    # 进入降级模式前，强行停顿，避免触发之前的封禁
+    time.sleep(random.uniform(3.0, 5.0))
+    
+    all_pct = []
+    for code in codes:
+        pure_code = code.replace('.SZ','').replace('.SH','').replace('.BJ','')
+        for attempt in range(retry):
+            try:
+                # 关键防封禁点：每次请求随机休眠1.5~3秒
+                time.sleep(random.uniform(1.5, 3.0))
+                
+                hist = ak.stock_zh_a_hist(symbol=pure_code, period="daily",
+                                          start_date=target_date, end_date=target_date,
+                                          adjust="qfq")
+                if hist is not None and not hist.empty:
+                    pct = hist.iloc[0]['涨跌幅']
+                    all_pct.append({'ts_code': code, 'pct_chg': pct})
+                    break  # 成功即跳出
+            except Exception as e:
+                if attempt < retry - 1:
+                    # 指数退避：重试时等待时间更长
+                    time.sleep(random.uniform(3.0, 6.0) * (attempt + 1))
+                else:
+                    print(f"   ❌ {code} 多次获取失败")
+        # 每个股票请求完毕再停顿0.5秒
+        time.sleep(0.5)
+    
+    if all_pct:
+        res = pd.DataFrame(all_pct)
+        res['target_date'] = target_date
+        return res
     return None
+# ==================================================================
 
 def calculate_stats(pct_df):
     if pct_df is None or pct_df.empty:
@@ -195,6 +199,10 @@ def run_rolling_analysis():
                 for skip in [0] + SKIP_DAYS_LIST:
                     data_cache[(date_str, lb, skip)] = {'pct_df': pd.DataFrame(), 'stocks': []}
                 continue
+            
+            # ✅ 防Tushare限流：请求一次连板数据后停顿一下
+            time.sleep(1.5) 
+            
             stocks_list = stocks[['ts_code', 'name']].to_dict('records')
             codes = stocks['ts_code'].unique().tolist()
 
@@ -219,7 +227,7 @@ def run_rolling_analysis():
                         print(f"   📈 {lb}连板 T+{skip}: {stats['总样本数']}只 | 上涨{stats['上涨比例(%)']}%")
                 else:
                     data_cache[key] = {'pct_df': pd.DataFrame(), 'stocks': stocks_list}
-            time.sleep(0.1)
+            time.sleep(0.5)  # 额外降速
 
     # 保存缓存
     all_records = []
