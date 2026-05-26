@@ -1,0 +1,6 @@
+tushare
+akshare
+pandas
+streamlit
+numpy
+pyarrow
