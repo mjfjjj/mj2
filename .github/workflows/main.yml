@@ -1,31 +1,43 @@
-name: Daily Data Update
+name: 每日数据更新
 
 on:
   schedule:
-    - cron: '30 8 * * 1-5'   # 北京时间 16:30
+    - cron: '30 8 * * 1-5'   # 北京时间 16:30，周一至周五
   workflow_dispatch:
 
 jobs:
   update-data:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout repository
+      - name: 检出仓库
         uses: actions/checkout@v4
-
-      - name: Set up Python
+      
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install tushare akshare pandas numpy pyarrow
-
-      - name: Run update script
+          
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+        
+      - name: 运行更新脚本
         run: python lianban_rolling.py
-
-      - name: Commit and push updated data
+        
+      - name: 提交并推送更新数据
         run: |
           git config --global user.name 'github-actions'
           git config --global user.email 'actions@github.com'
+          
+          # 只添加你生成的 parquet 文件（如果有其他文件产生，可改成 git add .）
           git add rolling_cache.parquet
-          git diff --cached --quiet || (git commit -m "Auto update data [skip ci]" && git push)
+          
+          # 只有当有文件更改时才提交，避免报错
+          git diff --cached --quiet || git commit -m "自动更新数据 [skip ci]"
+          
+          # ⚠️ 核心修复：用你的个人 Token 强制覆盖远程仓库地址
+          git remote set-url origin https://${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }}.git
+          
+          # 推送上去
+          git push
