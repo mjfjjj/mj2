@@ -229,25 +229,35 @@ def run_rolling_analysis():
                     data_cache[key] = {'pct_df': pd.DataFrame(), 'stocks': stocks_list}
             time.sleep(0.5)  # 额外降速
 
+        # ==================== 替换开始 ====================
     # 保存缓存
     all_records = []
     for (date_str, lb, skip), entry in data_cache.items():
         if not entry['stocks']:
             continue
+        # 取出包含 name 列的完整股票数据
         stocks_df = pd.DataFrame(entry['stocks'])
+        
         if not entry['pct_df'].empty:
             pct_df = entry['pct_df'].copy()
+            # ============== 核心修复：合并 name 列 ==============
+            # 将 stocks_df 中的 'name' 列合并回 pct_df
+            if 'name' in stocks_df.columns:
+                pct_df = pct_df.merge(stocks_df[['ts_code', 'name']], on='ts_code', how='left')
+            # ==================================================
             pct_df['trade_date'] = date_str
             pct_df['连板数'] = lb
             pct_df['skip_days'] = skip
             all_records.append(pct_df)
         else:
+            # skip_days == 0 的数据（T日连板股）
             t0_df = stocks_df.copy()
             t0_df['trade_date'] = date_str
             t0_df['连板数'] = lb
             t0_df['skip_days'] = skip
             t0_df['pct_chg'] = None
             all_records.append(t0_df)
+    # ==================== 替换结束 ====================
     if all_records:
         final_df = pd.concat(all_records, ignore_index=True)
         final_df.to_parquet(cache_file, index=False)
