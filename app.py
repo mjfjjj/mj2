@@ -120,13 +120,4 @@ with tab2:
         daily_df = pd.DataFrame(daily_stats).sort_values(['交易日', '连板数'], ascending=[False, True])
         st.dataframe(daily_df, use_container_width=True, hide_index=True)
 
-        # 各连板梯队上涨比例折线图
-        st.subheader("📈 各连板梯队上涨比例折线图")
-        chart_data = daily_df.pivot_table(
-            index='交易日', columns='连板数', values='上涨比例%', aggfunc='mean'
-        )
-        ordered_cols = [c for c in [1,2,3,4,5] if c in chart_data.columns]
-        chart_data = chart_data[ordered_cols]
-        st.line_chart(chart_data)
-
     st.caption(f"数据更新至：{max_date.strftime('%Y-%m-%d')}")
