@@ -1,10 +1,9 @@
 """
-连板股数据采集脚本（完整版）
+连板股数据采集脚本（精简版）
 功能：
   1. 获取首板~五连板股票（仅主板，排除ST/*ST）
   2. 统计 T+1 / T+2 涨跌幅、最大跌幅、上涨比例
-  3. 获取当日上证指数、深证成指、沪深300行情
-  4. 滚动窗口：从 2026-04-01 起，每加入新交易日剔除最早交易日
+  3. 滚动窗口：从 2026-04-01 起，每加入新交易日剔除最早交易日
 数据源：AkShare（主）+ Tushare（备用）
 """
 
@@ -177,63 +176,6 @@ def get_future_pct(codes: list, base_date: str, skip_days: int):
     return None
 
 
-# ------------------- 大盘指数获取 -------------------
-def get_index_snapshot(date_str: str) -> dict:
-    """
-    获取上证指数(000001)、深证成指(399001)、沪深300(000300)的当日涨跌幅
-    优先 Tushare index_daily，失败则尝试 AkShare
-    """
-    result = {'上证指数': None, '深证成指': None, '沪深300': None}
-    index_map = {
-        '000001.SH': '上证指数',
-        '399001.SZ': '深证成指',
-        '000300.SH': '沪深300',
-    }
-
-    # ① Tushare
-    try:
-        df = pro.index_daily(ts_code=','.join(index_map.keys()),
-                             start_date=date_str, end_date=date_str,
-                             fields='ts_code,pct_chg')
-        if df is not None and not df.empty:
-            for _, row in df.iterrows():
-                name = index_map.get(row['ts_code'])
-                if name:
-                    result[name] = round(float(row['pct_chg']), 2)
-            if all(v is not None for v in result.values()):
-                return result
-    except Exception:
-        pass
-
-    # ② AkShare 备用（stock_zh_index_daily_em）
-    try:
-        df = ak.stock_zh_index_daily_em(symbol="sh000001")
-        if df is not None and not df.empty:
-            row = df[df['date'] == date_str]
-            if not row.empty:
-                result['上证指数'] = round(float(row.iloc[0]['pct_chg']), 2)
-    except Exception:
-        pass
-    try:
-        df = ak.stock_zh_index_daily_em(symbol="sz399001")
-        if df is not None and not df.empty:
-            row = df[df['date'] == date_str]
-            if not row.empty:
-                result['深证成指'] = round(float(row.iloc[0]['pct_chg']), 2)
-    except Exception:
-        pass
-    try:
-        df = ak.stock_zh_index_daily_em(symbol="sh000300")
-        if df is not None and not df.empty:
-            row = df[df['date'] == date_str]
-            if not row.empty:
-                result['沪深300'] = round(float(row.iloc[0]['pct_chg']), 2)
-    except Exception:
-        pass
-
-    return result
-
-
 # ------------------- 统计函数 -------------------
 def calc_stats(pct_series: pd.Series):
     """输入一列涨跌幅，返回统计字典"""
@@ -272,7 +214,6 @@ def run_rolling_analysis():
 
     cache_file = 'rolling_cache.parquet'
     data_cache = {}          # key: (date, lianban, skip) -> DataFrame
-    index_cache = {}         # key: date -> index dict
 
     # --- 加载已有缓存 ---
     if os.path.exists(cache_file):
@@ -281,11 +222,6 @@ def run_rolling_analysis():
             print("✅ 加载缓存。")
             for (dt, lb, sk), grp in old.groupby(['trade_date', '连板数', 'skip_days']):
                 data_cache[(dt, lb, sk)] = grp.copy()
-            # 加载指数缓存
-            if 'index_name' in old.columns:
-                idx_df = old[['trade_date', 'index_name', 'index_pct']].drop_duplicates()
-                for _, r in idx_df.iterrows():
-                    index_cache.setdefault(r['trade_date'], {})[r['index_name']] = r['index_pct']
         except Exception:
             print("⚠️ 缓存加载失败，重新采集。")
 
@@ -293,14 +229,6 @@ def run_rolling_analysis():
     print("\n📊 采集数据...")
     for i, dt in enumerate(all_dates):
         print(f"\n[{i+1}/{len(all_dates)}] {dt}")
-
-        # 大盘指数（仅当天未缓存时获取）
-        if dt not in index_cache:
-            idx_val = get_index_snapshot(dt)
-            index_cache[dt] = idx_val
-            print(f"   📊 大盘: 上证{idx_val['上证指数']}%  深证{idx_val['深证成指']}%  沪深300{idx_val['沪深300']}%")
-        else:
-            print(f"   ⏩ 大盘: 使用缓存")
 
         for lb in LIANBAN_LIST:
             # 获取连板股
@@ -349,19 +277,6 @@ def run_rolling_analysis():
         sub['连板数'] = lb
         sub['skip_days'] = sk
         all_rows.append(sub)
-
-    # 追加指数数据
-    idx_rows = []
-    for dt, vals in index_cache.items():
-        for name in ['上证指数', '深证成指', '沪深300']:
-            if vals.get(name) is not None:
-                idx_rows.append({
-                    'trade_date': dt, '连板数': -1, 'skip_days': -1,
-                    'ts_code': '', 'name': '', 'pct_chg': None,
-                    'index_name': name, 'index_pct': vals[name],
-                })
-    if idx_rows:
-        all_rows.append(pd.DataFrame(idx_rows))
 
     if all_rows:
         final = pd.concat(all_rows, ignore_index=True)
