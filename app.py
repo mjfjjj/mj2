@@ -1,5 +1,5 @@
 """
-连板复盘与滚动统计 — 手机看板 (Streamlit)
+连板复盘与滚动统计 — 手机看板（仅 T+1）
 """
 import streamlit as st
 import pandas as pd
@@ -22,7 +22,7 @@ df = load_data()
 all_dates = sorted(df['trade_date'].unique())
 min_date, max_date = all_dates[0], all_dates[-1]
 
-tab1, tab2 = st.tabs(["📋 今日涨停板", "📈 滚动统计"])
+tab1, tab2 = st.tabs(["📋 今日涨停板", "📈 滚动统计（T+1）"])
 
 # ==================== 标签1：今日涨停板 ====================
 with tab1:
@@ -45,24 +45,22 @@ with tab1:
             st.dataframe(show, use_container_width=True, hide_index=True)
             st.divider()
 
-# ==================== 标签2：滚动统计 ====================
+# ==================== 标签2：滚动统计（仅 T+1） ====================
 with tab2:
-    st.title("📈 A股主板连板股 · 滚动统计")
-    st.caption("起始：2026-04-01 | 每新增一个交易日自动剔除最早交易日 | T+1 / T+2 分开统计")
+    st.title("📈 A股主板连板股 · 滚动统计（T+1）")
+    st.caption("起始：2026-04-01 | 每新增一个交易日自动剔除最早交易日 | 仅统计 T+1 表现")
 
     st.sidebar.header("⚙️ 筛选条件")
     end_dt = st.sidebar.date_input("截止日期", value=max_date, min_value=min_date, max_value=max_date)
     start_dt = pd.Timestamp('2026-04-01')
 
     av_lb = sorted(df['连板数'].unique())
-    default_lb = [lb for lb in av_lb if lb != 1]   # 默认不选首板
+    default_lb = [lb for lb in av_lb if lb != 1]
     sel_lb = st.sidebar.multiselect("连板数", av_lb, default=default_lb)
 
-    av_sk = sorted([s for s in df['skip_days'].unique() if s > 0])
-    sel_sk = st.sidebar.selectbox("观察日", av_sk, format_func=lambda x: f"T+{x}")
-
+    # 固定观察日为 T+1，不再提供选择
     mask = (df['trade_date'] >= start_dt) & (df['trade_date'] <= pd.Timestamp(end_dt))
-    mask &= df['连板数'].isin(sel_lb) & (df['skip_days'] == sel_sk)
+    mask &= df['连板数'].isin(sel_lb) & (df['skip_days'] == 1)
     win = df.loc[mask]
 
     if win.empty:
@@ -74,7 +72,7 @@ with tab2:
         st.sidebar.metric("交易日数", td_cnt)
 
         # KPI 卡片
-        st.subheader(f"📊 各连板梯队滚动统计 (T+{sel_sk})")
+        st.subheader(f"📊 各连板梯队滚动统计")
         for lb in sel_lb:
             lb_df = win[win['连板数'] == lb]
             total = len(lb_df)
