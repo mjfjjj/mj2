@@ -18,12 +18,7 @@ def load_data():
     df['trade_date'] = pd.to_datetime(df['trade_date'].astype(str))
     return df.sort_values('trade_date')
 
-df_all = load_data()
-
-# 分离连板数据和指数数据
-df = df_all[df_all['连板数'] >= 0].copy()
-df_idx = df_all[df_all['index_name'].notna()].copy() if 'index_name' in df_all.columns else pd.DataFrame()
-
+df = load_data()
 all_dates = sorted(df['trade_date'].unique())
 min_date, max_date = all_dates[0], all_dates[-1]
 
@@ -38,22 +33,10 @@ with tab1:
     latest = max_date
     t0 = df[(df['trade_date'] == latest) & (df['skip_days'] == 0)]
 
-    # 大盘指数
-    if not df_idx.empty:
-        idx_today = df_idx[df_idx['trade_date'] == latest]
-        if not idx_today.empty:
-            st.subheader("📊 当日大盘指数")
-            cols = st.columns(3)
-            for j, name in enumerate(['上证指数', '深证成指', '沪深300']):
-                row = idx_today[idx_today['index_name'] == name]
-                val = f"{row['index_pct'].values[0]:+.2f}%" if not row.empty else "-"
-                cols[j].metric(name, val)
-            st.divider()
-
     if t0.empty:
         st.warning(f"暂无 {latest.strftime('%Y-%m-%d')} 的涨停数据，请等待收盘后数据采集完成。")
     else:
-        st.success(f"📅 数据日期：{latest.strftime('%Y-%m-%d')}（{'交易日' if latest.weekday() < 5 else '非交易日？'}）")
+        st.success(f"📅 数据日期：{latest.strftime('%Y-%m-%d')}")
         for lb in sorted(t0['连板数'].unique()):
             sub = t0[t0['连板数'] == lb]
             st.subheader(f"🔥 {lb}连板（{len(sub)}只）")
@@ -73,7 +56,9 @@ with tab2:
     start_dt = pd.Timestamp('2026-04-01')
 
     av_lb = sorted(df['连板数'].unique())
-    sel_lb = st.sidebar.multiselect("连板数", av_lb, default=av_lb)
+    # ✅ 唯一改动：默认选中除1连板以外的所有连板数
+    default_lb = [lb for lb in av_lb if lb != 1]
+    sel_lb = st.sidebar.multiselect("连板数", av_lb, default=default_lb)
 
     av_sk = sorted([s for s in df['skip_days'].unique() if s > 0])
     sel_sk = st.sidebar.selectbox("观察日", av_sk, format_func=lambda x: f"T+{x}")
@@ -89,19 +74,6 @@ with tab2:
         st.sidebar.metric("窗口起始", str(start_dt.date()))
         st.sidebar.metric("窗口截止", str(end_dt))
         st.sidebar.metric("交易日数", td_cnt)
-
-        # 大盘指数
-        if not df_idx.empty:
-            idx_win = df_idx[(df_idx['trade_date'] >= start_dt) & (df_idx['trade_date'] <= pd.Timestamp(end_dt))]
-            if not idx_win.empty:
-                st.subheader("📊 窗口内大盘指数")
-                c = st.columns(3)
-                for j, name in enumerate(['上证指数', '深证成指', '沪深300']):
-                    sub_i = idx_win[idx_win['index_name'] == name]
-                    if not sub_i.empty:
-                        avg_i = round(sub_i['index_pct'].mean(), 2)
-                        c[j].metric(f"{name} 日均涨跌", f"{avg_i:+.2f}%")
-                st.divider()
 
         # KPI 卡片
         st.subheader(f"📊 各连板梯队滚动统计 (T+{sel_sk})")
@@ -159,7 +131,7 @@ with tab2:
         # 折线图：各连板梯队上涨比例
         st.subheader("📈 各连板梯队上涨比例折线图")
         chart_data = daily_df.pivot_table(index='交易日', columns='连板数', values='上涨比例%', aggfunc='mean')
-        ordered = [c for c in [1, 2, 3, 4, 5] if c in chart_data.columns]
+        ordered = [c for c in [2, 3, 4, 5] if c in chart_data.columns]  # 仅显示2-5连板
         chart_data = chart_data[ordered]
         st.line_chart(chart_data)
 
