@@ -22,7 +22,6 @@ df = load_data()
 all_dates = sorted(df['trade_date'].unique())
 min_date, max_date = all_dates[0], all_dates[-1]
 
-# ==================== 页面标签 ====================
 tab1, tab2 = st.tabs(["📋 今日涨停板", "📈 滚动统计"])
 
 # ==================== 标签1：今日涨停板 ====================
@@ -56,8 +55,7 @@ with tab2:
     start_dt = pd.Timestamp('2026-04-01')
 
     av_lb = sorted(df['连板数'].unique())
-    # ✅ 唯一改动：默认选中除1连板以外的所有连板数
-    default_lb = [lb for lb in av_lb if lb != 1]
+    default_lb = [lb for lb in av_lb if lb != 1]   # 默认不选首板
     sel_lb = st.sidebar.multiselect("连板数", av_lb, default=default_lb)
 
     av_sk = sorted([s for s in df['skip_days'].unique() if s > 0])
@@ -87,20 +85,16 @@ with tab2:
             up_r = (up_c / total * 100) if total > 0 else 0
             up_avg = round(up_df['pct_chg'].mean(), 2) if up_c > 0 else 0
             down_avg = round(down_df['pct_chg'].mean(), 2) if down_c > 0 else 0
-            max_up = round(lb_df['pct_chg'].max(), 2)
-            max_down = round(lb_df['pct_chg'].min(), 2)
             mean_all = round(lb_df['pct_chg'].mean(), 2)
 
             st.markdown(f"### {lb} 连板")
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2 = st.columns(2)
             c1.metric("样本数", total)
             c2.metric("上涨", f"{up_c}只 ({up_r:.1f}%)")
+            c3, c4, c5 = st.columns(3)
             c3.metric("上涨均幅", f"{up_avg}%")
             c4.metric("下跌均幅", f"{down_avg}%")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("最大涨幅", f"{max_up}%")
-            c2.metric("最大跌幅", f"{max_down}%")
-            c3.metric("平均涨跌幅", f"{mean_all}%")
+            c5.metric("平均涨跌幅", f"{mean_all}%")
             st.divider()
 
         # 每日明细
@@ -121,17 +115,16 @@ with tab2:
                     '上涨比例%': round(up_d / tot * 100, 2) if tot > 0 else 0,
                     '上涨均幅%': round(dd[dd['pct_chg'] > 0]['pct_chg'].mean(), 2) if up_d > 0 else 0,
                     '下跌均幅%': round(dd[dd['pct_chg'] < 0]['pct_chg'].mean(), 2) if len(dd[dd['pct_chg'] < 0]) > 0 else 0,
-                    '最大涨幅%': round(dd['pct_chg'].max(), 2),
-                    '最大跌幅%': round(dd['pct_chg'].min(), 2),
+                    '平均涨跌幅%': round(dd['pct_chg'].mean(), 2),
                     '股票': '、'.join(dd['name'].dropna().unique()),
                 })
         daily_df = pd.DataFrame(daily).sort_values(['交易日', '连板数'], ascending=[False, True])
         st.dataframe(daily_df, use_container_width=True, hide_index=True)
 
-        # 折线图：各连板梯队上涨比例
+        # 折线图
         st.subheader("📈 各连板梯队上涨比例折线图")
         chart_data = daily_df.pivot_table(index='交易日', columns='连板数', values='上涨比例%', aggfunc='mean')
-        ordered = [c for c in [2, 3, 4, 5] if c in chart_data.columns]  # 仅显示2-5连板
+        ordered = [c for c in [2, 3, 4, 5] if c in chart_data.columns]
         chart_data = chart_data[ordered]
         st.line_chart(chart_data)
 
