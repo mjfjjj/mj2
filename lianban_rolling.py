@@ -1,8 +1,8 @@
 """
-连板股数据采集脚本（精简版）
+连板股数据采集脚本（精简版 · 无最大涨跌幅）
 功能：
   1. 获取首板~五连板股票（仅主板，排除ST/*ST）
-  2. 统计 T+1 / T+2 涨跌幅、最大跌幅、上涨比例
+  2. 统计 T+1 / T+2 涨跌幅、上涨比例、上涨均幅、下跌均幅、平均涨跌幅
   3. 滚动窗口：从 2026-04-01 起，每加入新交易日剔除最早交易日
 数据源：AkShare（主）+ Tushare（备用）
 """
@@ -20,19 +20,17 @@ warnings.filterwarnings('ignore')
 
 # ==================== 配置区 ====================
 TUSHARE_TOKEN = '014ba2364f885e96f637e04d79ad0e2f180aeaa3dbae860640cc63ca'
-START_DATE = '20260401'                  # 滚动窗口起始日
-LIANBAN_LIST = [1, 2, 3, 4, 5]          # 需要统计的连板数（含首板）
-SKIP_DAYS_LIST = [1, 2]                 # T+1 和 T+2
-RETRY_COUNT = 3                          # 接口重试次数
-SLEEP_BETWEEN_STOCKS = 0.05             # 单只股票间休眠秒数
+START_DATE = '20260401'
+LIANBAN_LIST = [1, 2, 3, 4, 5]
+SKIP_DAYS_LIST = [1, 2]
+RETRY_COUNT = 3
+SLEEP_BETWEEN_STOCKS = 0.05
 # =================================================
 
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
 
-# ------------------- 交易日历 -------------------
 def get_trade_cal(start: str, end: str):
-    """获取交易日历，Tushare 为主，AkShare 备用"""
     try:
         df = pro.trade_cal(exchange='SSE', start_date=start, end_date=end, is_open='1')
         if df is not None and not df.empty:
@@ -56,9 +54,7 @@ def get_trade_cal(start: str, end: str):
         cur += timedelta(days=1)
     return dates
 
-
 def get_next_trade_date(base_date: str, skip_days: int):
-    """获取 base_date 之后第 skip_days 个交易日，若日期≥今天则返回 None"""
     try:
         cal = pro.trade_cal(exchange='SSE', start_date=base_date,
                             end_date=(datetime.strptime(base_date, '%Y%m%d') + timedelta(days=15)).strftime('%Y%m%d'),
@@ -73,7 +69,6 @@ def get_next_trade_date(base_date: str, skip_days: int):
             dates = sorted(cal['trade_date'].dt.strftime('%Y%m%d').unique())
         except Exception:
             return None
-
     try:
         idx = dates.index(base_date)
     except ValueError:
@@ -85,16 +80,8 @@ def get_next_trade_date(base_date: str, skip_days: int):
         return None
     return target
 
-
-# ------------------- 连板股获取 -------------------
 def get_lianban_stocks(date_str: str, lianban_num: int) -> pd.DataFrame:
-    """
-    获取指定日期、指定连板数的股票（仅主板、非ST）
-    优先 AkShare，失败时降级 Tushare
-    """
     stocks = pd.DataFrame()
-
-    # ① AkShare
     try:
         raw = ak.stock_zt_pool_em(date=date_str)
         if raw is not None and not raw.empty:
@@ -107,8 +94,6 @@ def get_lianban_stocks(date_str: str, lianban_num: int) -> pd.DataFrame:
                 })
     except Exception:
         pass
-
-    # ② Tushare 备用
     if stocks.empty:
         try:
             df = pro.limit_step(trade_date=date_str, nums=str(lianban_num))
@@ -116,31 +101,20 @@ def get_lianban_stocks(date_str: str, lianban_num: int) -> pd.DataFrame:
                 stocks = df[['ts_code', 'name']].copy()
         except Exception:
             pass
-
     if stocks.empty:
         return stocks
-
-    # 过滤 ST
     if 'name' in stocks.columns:
         stocks = stocks[~stocks['name'].str.contains('ST', case=False, na=False)]
-
-    # 过滤主板（60xxxx / 00xxxx）
     def is_main(code):
         c = str(code).replace('.SZ', '').replace('.SH', '').replace('.BJ', '')
         return c.startswith(('60', '00'))
     stocks = stocks[stocks['ts_code'].apply(is_main)]
-
     return stocks
 
-
-# ------------------- T+1 / T+2 涨跌幅获取 -------------------
 def get_future_pct(codes: list, base_date: str, skip_days: int):
-    """获取 base_date 后第 skip_days 个交易日的涨跌幅"""
     target_date = get_next_trade_date(base_date, skip_days)
     if target_date is None:
         return None
-
-    # ① Tushare
     try:
         ts_codes = ','.join(codes)
         daily = pro.daily(ts_code=ts_codes, trade_date=target_date, fields='ts_code,pct_chg')
@@ -149,8 +123,6 @@ def get_future_pct(codes: list, base_date: str, skip_days: int):
             return daily
     except Exception:
         pass
-
-    # ② AkShare 备用
     all_pct = []
     for code in codes:
         pure = code.replace('.SZ', '').replace('.SH', '').replace('.BJ', '')
@@ -175,10 +147,7 @@ def get_future_pct(codes: list, base_date: str, skip_days: int):
         return res
     return None
 
-
-# ------------------- 统计函数 -------------------
 def calc_stats(pct_series: pd.Series):
-    """输入一列涨跌幅，返回统计字典"""
     total = len(pct_series)
     if total == 0:
         return None
@@ -196,13 +165,9 @@ def calc_stats(pct_series: pd.Series):
         '上涨比例(%)': round(up_cnt / total * 100, 2),
         '上涨均幅(%)': round(up.mean(), 2) if up_cnt > 0 else 0,
         '下跌均幅(%)': round(down.mean(), 2) if down_cnt > 0 else 0,
-        '最大涨幅(%)': round(pct_series.max(), 2),
-        '最大跌幅(%)': round(pct_series.min(), 2),
         '平均涨跌幅(%)': round(pct_series.mean(), 2),
     }
 
-
-# ------------------- 主流程 -------------------
 def run_rolling_analysis():
     today = datetime.now().strftime('%Y%m%d')
     print(f"🚀 滚动分析：{START_DATE} → {today}")
@@ -213,9 +178,8 @@ def run_rolling_analysis():
     print(f"📅 共 {len(all_dates)} 个交易日")
 
     cache_file = 'rolling_cache.parquet'
-    data_cache = {}          # key: (date, lianban, skip) -> DataFrame
+    data_cache = {}
 
-    # --- 加载已有缓存 ---
     if os.path.exists(cache_file):
         try:
             old = pd.read_parquet(cache_file)
@@ -225,23 +189,18 @@ def run_rolling_analysis():
         except Exception:
             print("⚠️ 缓存加载失败，重新采集。")
 
-    # --- 逐日采集 ---
     print("\n📊 采集数据...")
     for i, dt in enumerate(all_dates):
         print(f"\n[{i+1}/{len(all_dates)}] {dt}")
-
         for lb in LIANBAN_LIST:
-            # 获取连板股
             stocks = get_lianban_stocks(dt, lb)
             if stocks.empty:
                 for sk in [0] + SKIP_DAYS_LIST:
                     data_cache[(dt, lb, sk)] = pd.DataFrame()
                 continue
-
             codes = stocks['ts_code'].unique().tolist()
             stocks_info = stocks[['ts_code', 'name']].copy()
 
-            # T 日列表 (skip=0)
             key_t0 = (dt, lb, 0)
             if key_t0 not in data_cache:
                 t0_df = stocks_info.copy()
@@ -249,7 +208,6 @@ def run_rolling_analysis():
                 data_cache[key_t0] = t0_df
                 print(f"   📋 {lb}连板 T日: {len(stocks)}只")
 
-            # T+1 / T+2
             for sk in SKIP_DAYS_LIST:
                 key = (dt, lb, sk)
                 if key in data_cache and not data_cache[key].empty:
@@ -262,12 +220,12 @@ def run_rolling_analysis():
                     s = calc_stats(merged['pct_chg'])
                     if s:
                         print(f"   📈 {lb}连板 T+{sk}: {s['样本数']}只 | "
-                              f"上涨{s['上涨比例(%)']}% | 最大涨幅{s['最大涨幅(%)']}% | 最大跌幅{s['最大跌幅(%)']}%")
+                              f"上涨{s['上涨比例(%)']}% | "
+                              f"上涨均幅{s['上涨均幅(%)']}% | 下跌均幅{s['下跌均幅(%)']}% | 平均涨跌幅{s['平均涨跌幅(%)']}%")
                 else:
                     data_cache[key] = pd.DataFrame()
             time.sleep(0.1)
 
-    # --- 保存缓存 ---
     all_rows = []
     for (dt, lb, sk), sub in data_cache.items():
         if sub.empty:
@@ -283,7 +241,6 @@ def run_rolling_analysis():
         final.to_parquet(cache_file, index=False)
         print(f"\n💾 缓存已保存: {cache_file}")
 
-    # --- 打印滚动统计 ---
     print("\n📈 滚动统计（按连板数 × 观察日 × 全窗口）")
     print("=" * 80)
     for sk in SKIP_DAYS_LIST:
@@ -307,9 +264,8 @@ def run_rolling_analysis():
                     print(f"\n📊 {lb}连板 窗口 [{w_start}~{w_end}] ({len(win_dates)}天) T+{sk}")
                     print(f"   样本: {s['样本数']} | 上涨: {s['上涨数']}({s['上涨比例(%)']}%)")
                     print(f"   上涨均幅: {s['上涨均幅(%)']}% | 下跌均幅: {s['下跌均幅(%)']}%")
-                    print(f"   最大涨幅: {s['最大涨幅(%)']}% | 最大跌幅: {s['最大跌幅(%)']}% | 平均涨跌幅: {s['平均涨跌幅(%)']}%")
+                    print(f"   平均涨跌幅: {s['平均涨跌幅(%)']}%")
     print("\n✅ 完成！")
-
 
 if __name__ == '__main__':
     run_rolling_analysis()
