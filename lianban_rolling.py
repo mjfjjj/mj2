@@ -1,8 +1,8 @@
 """
-连板股数据采集脚本（精简版 · 无最大涨跌幅）
+连板股数据采集脚本（仅 T+1）
 功能：
   1. 获取首板~五连板股票（仅主板，排除ST/*ST）
-  2. 统计 T+1 / T+2 涨跌幅、上涨比例、上涨均幅、下跌均幅、平均涨跌幅
+  2. 统计 T+1 涨跌幅、上涨比例、上涨均幅、下跌均幅、平均涨跌幅
   3. 滚动窗口：从 2026-04-01 起，每加入新交易日剔除最早交易日
 数据源：AkShare（主）+ Tushare（备用）
 """
@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')
 TUSHARE_TOKEN = '014ba2364f885e96f637e04d79ad0e2f180aeaa3dbae860640cc63ca'
 START_DATE = '20260401'
 LIANBAN_LIST = [1, 2, 3, 4, 5]
-SKIP_DAYS_LIST = [1, 2]
+SKIP_DAYS_LIST = [1]                     # 仅 T+1
 RETRY_COUNT = 3
 SLEEP_BETWEEN_STOCKS = 0.05
 # =================================================
@@ -241,12 +241,10 @@ def run_rolling_analysis():
         final.to_parquet(cache_file, index=False)
         print(f"\n💾 缓存已保存: {cache_file}")
 
-    print("\n📈 滚动统计（按连板数 × 观察日 × 全窗口）")
+    print("\n📈 滚动统计（按连板数 × T+1 × 全窗口）")
     print("=" * 80)
     for sk in SKIP_DAYS_LIST:
-        print(f"\n{'='*60}")
-        print(f"  📌 观察日: T+{sk}")
-        print(f"{'='*60}")
+        print(f"\n📌 观察日: T+{sk}")
         for i in range(len(all_dates)):
             win_dates = all_dates[:i+1]
             w_start, w_end = win_dates[0], win_dates[-1]
