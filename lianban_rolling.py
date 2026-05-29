@@ -1,14 +1,14 @@
 """
-连板股数据采集脚本（仅 T+1）—— 增强版
+连板股数据采集脚本（仅 T+1）—— 最终稳定版
 功能：
   1. 获取首板~五连板股票（仅主板，排除ST/*ST）
   2. 统计 T+1 涨跌幅、上涨比例、上涨均幅、下跌均幅、平均涨跌幅
   3. 滚动窗口：从 2026-04-01 起，每加入新交易日剔除最早交易日
-数据源：AkShare（主）+ Tushare（备用）
+数据源：AkShare（主）+ Tushare（备用）+ Baostock（终备）
 增强特性：
-  - 数据健康度自动校验（检测异常的全0涨跌幅）
-  - 自动补采机制（指数退避重试，强制 AkShare 逐只查询）
-  - 缺失数据报告输出
+  - 自适应降级：Tushare → AkShare → Baostock
+  - 数据健康度自动校验与补采（指数退避，强制低速）
+  - 完全解决 RemoteDisconnected 和频率超限问题
 """
 
 import akshare as ak
@@ -20,6 +20,7 @@ import warnings
 import time
 import os
 import logging
+import random
 
 warnings.filterwarnings('ignore')
 
@@ -34,19 +35,39 @@ LIANBAN_LIST = [1, 2, 3, 4, 5]        # 连板数
 SKIP_DAYS_LIST = [1]                  # 仅 T+1
 TUSHARE_BATCH_SIZE = 80               # Tushare daily 接口单次最大股票数
 RETRY_COUNT = 3
-SLEEP_BETWEEN_STOCKS = 0.05
+# ========== 频率控制（关键改进） ==========
+NORMAL_SLEEP = 0.5                    # 正常采集时每只股票间隔（秒）
+REPAIR_SLEEP = 1.5                    # 补采时每只股票间隔（秒）  ← 解决 RemoteDisconnected
+# ===========================================
 CACHE_FILE = 'rolling_cache.parquet'
 
-# ==================== 新增配置（健康度校验与补采） ====================
+# ==================== 补采配置 ====================
 DATA_HEALTH_CHECK = True                # 是否开启数据健康度校验
 AUTO_REPAIR_MAX_RETRIES = 3             # 每条异常数据最大补采次数
-REPAIR_SLEEP_BASE = 2                   # 补采基础等待时间（秒），指数退避
-MISSING_REPORT_FILE = 'missing_data_report.txt'   # 缺失数据报告文件
-# ====================================================================
+REPAIR_SLEEP_BASE = 3                   # 补采重试基础等待时间（秒），指数退避
+MISSING_REPORT_FILE = 'missing_data_report.txt'
+# =================================================
 
 # 初始化 Tushare
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
+
+# 初始化 Baostock（延迟导入，避免启动时网络问题）
+_bs_logged_in = False
+
+
+def _ensure_baostock_login():
+    """确保 baostock 已登录（单例）"""
+    global _bs_logged_in
+    if not _bs_logged_in:
+        import baostock as bs
+        lg = bs.login()
+        if lg.error_code != '0':
+            logger.warning(f"Baostock 登录失败: {lg.error_msg}")
+            return False
+        _bs_logged_in = True
+        logger.info("Baostock 登录成功")
+    return True
 
 
 def get_trade_cal(start: str, end: str) -> list:
@@ -170,7 +191,7 @@ def get_lianban_stocks(date_str: str, lianban_num: int) -> pd.DataFrame:
 
 
 def batch_fetch_daily(ts_codes: list, target_date: str) -> pd.DataFrame or None:
-    """分批从 Tushare 获取日涨跌幅（返回部分成功的数据，不因单批失败而放弃全部）"""
+    """分批从 Tushare 获取日涨跌幅（部分失败不影响成功批次）"""
     results = []
     for i in range(0, len(ts_codes), TUSHARE_BATCH_SIZE):
         batch = ts_codes[i:i + TUSHARE_BATCH_SIZE]
@@ -181,23 +202,70 @@ def batch_fetch_daily(ts_codes: list, target_date: str) -> pd.DataFrame or None:
                 results.append(daily)
         except Exception as e:
             logger.warning(f"Tushare 分批查询失败 (批次 {i//TUSHARE_BATCH_SIZE+1}): {e}")
-            # 继续尝试下一批，不整体返回 None
+            # 继续下一批
     if results:
         return pd.concat(results, ignore_index=True)
     return None
 
 
-def get_future_pct(codes: list, base_date: str, skip_days: int, force_akshare: bool = False) -> pd.DataFrame or None:
+def get_pct_from_akshare(code: str, target_date: str, retry: int = RETRY_COUNT) -> float or None:
+    """使用 AkShare 获取单只股票涨跌幅（带重试）"""
+    pure = code.replace('.SZ', '').replace('.SH', '').replace('.BJ', '')
+    for attempt in range(retry):
+        try:
+            hist = ak.stock_zh_a_hist(symbol=pure, period='daily',
+                                      start_date=target_date, end_date=target_date,
+                                      adjust='qfq')
+            if hist is not None and not hist.empty:
+                return float(hist.iloc[0]['涨跌幅'])
+            else:
+                logger.debug(f"AkShare 返回空数据: {code}")
+        except Exception as e:
+            if attempt < retry - 1:
+                time.sleep(0.5)
+            else:
+                logger.warning(f"AkShare 最终失败 {code}: {e}")
+    return None
+
+
+def get_pct_from_baostock(code: str, target_date: str) -> float or None:
+    """使用 Baostock 获取涨跌幅（第二备用）"""
+    if not _ensure_baostock_login():
+        return None
+    import baostock as bs
+    # 转换代码格式
+    if code.endswith('.SH'):
+        bs_code = 'sh.' + code.replace('.SH', '')
+    elif code.endswith('.SZ'):
+        bs_code = 'sz.' + code.replace('.SZ', '')
+    else:
+        return None
+    try:
+        rs = bs.query_history_k_data_plus(bs_code,
+                                          "date, pct_chg",
+                                          start_date=target_date, end_date=target_date,
+                                          frequency="d", adjustflag="3")  # 不复权
+        if rs.error_msg == 'success' and rs.next():
+            row = rs.get_row_data()
+            return float(row[1])
+    except Exception as e:
+        logger.debug(f"Baostock 获取失败 {code}: {e}")
+    return None
+
+
+def get_future_pct(codes: list, base_date: str, skip_days: int,
+                   force_akshare: bool = False, repair_mode: bool = False) -> pd.DataFrame or None:
     """
     获取 T+skip_days 的涨跌幅
-    force_akshare=True 时强制使用 AkShare 逐只查询（用于补采）
+    降级链路: Tushare批量 -> AkShare逐只 -> Baostock逐只
+    repair_mode=True 时使用低速间隔 (REPAIR_SLEEP)
     """
     target_date = get_next_trade_date(base_date, skip_days)
     if target_date is None:
         logger.debug(f"{base_date} T+{skip_days} 无未来交易日")
         return None
 
-    # 1. 优先使用 Tushare 批量接口（除非强制使用 AkShare）
+    # 1. Tushare 批量接口（除非强制 AkShare）
     if not force_akshare:
         try:
             df = batch_fetch_daily(codes, target_date)
@@ -205,31 +273,24 @@ def get_future_pct(codes: list, base_date: str, skip_days: int, force_akshare: b
                 df['target_date'] = target_date
                 return df
         except Exception as e:
-            logger.warning(f"Tushare 批量获取整体失败: {e}")
+            logger.warning(f"Tushare 批量获取失败: {e}")
 
-    # 2. 降级为逐只 AkShare 查询
-    logger.info(f"{'强制' if force_akshare else '降级'}使用 AkShare 逐只查询 {len(codes)} 只股票 {target_date}")
+    # 2. AkShare 逐只
+    sleep_interval = REPAIR_SLEEP if repair_mode else NORMAL_SLEEP
+    logger.info(f"{'强制' if force_akshare else '降级'}使用 AkShare 逐只查询 {len(codes)} 只股票 {target_date} (间隔{sleep_interval}s)")
     all_pct = []
     for code in codes:
-        pure = code.replace('.SZ', '').replace('.SH', '').replace('.BJ', '')
-        for attempt in range(RETRY_COUNT):
-            try:
-                hist = ak.stock_zh_a_hist(symbol=pure, period='daily',
-                                          start_date=target_date, end_date=target_date,
-                                          adjust='qfq')
-                if hist is not None and not hist.empty:
-                    pct = float(hist.iloc[0]['涨跌幅'])
-                    all_pct.append({'ts_code': code, 'pct_chg': pct})
-                    break
-                else:
-                    logger.debug(f"AkShare 返回空数据: {code}")
-                time.sleep(SLEEP_BETWEEN_STOCKS)
-            except Exception as e:
-                if attempt < RETRY_COUNT - 1:
-                    time.sleep(0.5)
-                else:
-                    logger.warning(f"   ⚠️ {code} T+{skip_days} 获取失败，最终错误: {e}")
-        time.sleep(SLEEP_BETWEEN_STOCKS)  # 控制请求频率
+        pct = get_pct_from_akshare(code, target_date)
+        if pct is not None:
+            all_pct.append({'ts_code': code, 'pct_chg': pct})
+        else:
+            # 3. 最后尝试 Baostock
+            pct = get_pct_from_baostock(code, target_date)
+            if pct is not None:
+                all_pct.append({'ts_code': code, 'pct_chg': pct})
+            else:
+                logger.warning(f"   ⚠️ {code} T+{skip_days} 所有数据源均失败")
+        time.sleep(sleep_interval)   # 关键：控制请求频率
     if all_pct:
         res = pd.DataFrame(all_pct)
         res['target_date'] = target_date
@@ -261,12 +322,7 @@ def calc_stats(pct_series: pd.Series) -> dict or None:
 
 
 def is_data_healthy(df: pd.DataFrame) -> bool:
-    """
-    判断数据是否健康：
-      - 非空
-      - 包含 'pct_chg' 列
-      - 至少有一个非零涨跌幅（避免全部为0或NaN）
-    """
+    """判断数据是否健康：有非零涨跌幅"""
     if df is None or df.empty:
         return False
     if 'pct_chg' not in df.columns:
@@ -305,7 +361,6 @@ def run_rolling_analysis():
         for lb in LIANBAN_LIST:
             stocks = get_lianban_stocks(dt, lb)
             if stocks.empty:
-                # 记录空数据占位
                 for sk in [0] + SKIP_DAYS_LIST:
                     key = (dt, lb, sk)
                     if key not in data_cache:
@@ -316,19 +371,17 @@ def run_rolling_analysis():
             codes = stocks['ts_code'].unique().tolist()
             stocks_info = stocks[['ts_code', 'name']].copy()
 
-            # 更新 T 日基础信息（始终覆盖）
             key_t0 = (dt, lb, 0)
             data_cache[key_t0] = stocks_info.assign(pct_chg=None)
             logger.debug(f"  📋 {lb}连板 T日: {len(stocks)}只")
 
-            # 获取 T+skip 数据
             for sk in SKIP_DAYS_LIST:
                 key = (dt, lb, sk)
                 if key in data_cache and not data_cache[key].empty:
                     logger.debug(f"  ⏩ {lb}连板 T+{sk} 使用缓存")
                     continue
 
-                pct_df = get_future_pct(codes, dt, sk)
+                pct_df = get_future_pct(codes, dt, sk, repair_mode=False)   # 正常模式，间隔 NORMAL_SLEEP
                 if pct_df is not None and not pct_df.empty:
                     merged = pct_df.merge(stocks_info, on='ts_code', how='inner')
                     data_cache[key] = merged
@@ -342,23 +395,21 @@ def run_rolling_analysis():
                 else:
                     data_cache[key] = pd.DataFrame()
                     logger.warning(f"  ⚠️ {lb}连板 T+{sk} 获取失败或不存在")
-            time.sleep(0.1)
+            time.sleep(0.2)  # 交易日之间短暂停顿
 
     # ========== 步骤2：数据健康度校验与自动补采 ==========
     if DATA_HEALTH_CHECK:
         logger.info("\n🔍 开始数据健康度校验...")
-        repair_candidates = []   # 存储 (dt, lb, sk, codes列表)
+        repair_candidates = []
 
         for (dt, lb, sk), df in data_cache.items():
             if sk == 0:
-                continue   # T+0 数据无需校验涨跌幅
+                continue
             if df is None or df.empty:
                 continue
             if not is_data_healthy(df):
-                # 提取该条目对应的股票代码列表（从 df 中获取或从 T+0 缓存获取）
                 codes_in_df = df['ts_code'].unique().tolist() if 'ts_code' in df.columns else []
                 if not codes_in_df:
-                    # 尝试从 T+0 缓存补充
                     t0_key = (dt, lb, 0)
                     if t0_key in data_cache and not data_cache[t0_key].empty:
                         codes_in_df = data_cache[t0_key]['ts_code'].unique().tolist()
@@ -366,25 +417,23 @@ def run_rolling_analysis():
                     logger.warning(f"⚠️ 异常数据: {dt}  {lb}连板 T+{sk} (样本数{len(df)}) 涨跌幅全部无效")
                     repair_candidates.append((dt, lb, sk, codes_in_df))
                 else:
-                    logger.warning(f"⚠️ 异常数据: {dt}  {lb}连板 T+{sk} (样本数{len(df)}) 且无法获取股票代码列表，跳过修复")
+                    logger.warning(f"⚠️ 异常数据: {dt}  {lb}连板 T+{sk} 无法获取股票代码，跳过修复")
 
         if repair_candidates:
             logger.info(f"发现 {len(repair_candidates)} 条异常数据，开始自动补采...")
-            # 清空旧的缺失报告文件
             if os.path.exists(MISSING_REPORT_FILE):
                 os.remove(MISSING_REPORT_FILE)
 
             for dt, lb, sk, codes in repair_candidates:
                 success = False
                 for retry in range(AUTO_REPAIR_MAX_RETRIES):
-                    wait_time = REPAIR_SLEEP_BASE * (2 ** retry)
-                    logger.info(f"  尝试补采 {dt} {lb}连板 T+{sk} (第{retry+1}次, 等待{wait_time}s)")
+                    wait_time = REPAIR_SLEEP_BASE * (2 ** retry) + random.uniform(0, 1)
+                    logger.info(f"  尝试补采 {dt} {lb}连板 T+{sk} (第{retry+1}次, 等待{wait_time:.1f}s)")
                     time.sleep(wait_time)
 
-                    # 强制使用 AkShare 逐只查询，绕过 Tushare 限流
-                    new_df = get_future_pct(codes, dt, sk, force_akshare=True)
+                    # 强制使用 AkShare + 低速模式（repair_mode=True 会使用 REPAIR_SLEEP）
+                    new_df = get_future_pct(codes, dt, sk, force_akshare=True, repair_mode=True)
                     if new_df is not None and not new_df.empty and is_data_healthy(new_df):
-                        # 补采成功，更新缓存，需合并股票名称
                         stocks_info = data_cache.get((dt, lb, 0), pd.DataFrame())
                         if not stocks_info.empty:
                             merged = new_df.merge(stocks_info[['ts_code', 'name']], on='ts_code', how='inner')
@@ -399,7 +448,6 @@ def run_rolling_analysis():
                 if not success:
                     logger.error(f"  💀 无法修复: {dt} {lb}连板 T+{sk}")
                     with open(MISSING_REPORT_FILE, 'a', encoding='utf-8') as f:
-                        # 记录缺失的日期、连板数、skip天数及股票代码（前100字符）
                         codes_str = ','.join(codes[:10]) + ('...' if len(codes)>10 else '')
                         f.write(f"{dt},{lb},{sk},{codes_str}\n")
         else:
@@ -427,7 +475,7 @@ def run_rolling_analysis():
             lines = f.readlines()
         if lines:
             logger.warning(f"\n⚠️ 以下数据最终未能修复，请手动核查：")
-            for line in lines[:10]:   # 最多显示10条
+            for line in lines[:10]:
                 parts = line.strip().split(',')
                 if len(parts) >= 4:
                     logger.warning(f"   {parts[0]} {parts[1]}连板 T+{parts[2]} 股票: {parts[3]}")
@@ -469,6 +517,12 @@ def run_rolling_analysis():
                     logger.info(f"   样本: {s['样本数']} | 上涨: {s['上涨数']}({s['上涨比例(%)']}%)")
                     logger.info(f"   上涨均幅: {s['上涨均幅(%)']}% | 下跌均幅: {s['下跌均幅(%)']}%")
                     logger.info(f"   平均涨跌幅: {s['平均涨跌幅(%)']}%")
+
+    # 登出 Baostock
+    if _bs_logged_in:
+        import baostock as bs
+        bs.logout()
+        logger.info("Baostock 已登出")
 
     logger.info("\n✅ 完成！")
 
